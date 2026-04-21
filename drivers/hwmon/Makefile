@@ -250,4 +250,6 @@ obj-$(CONFIG_SENSORS_OCC)	+= occ/
 obj-$(CONFIG_SENSORS_PECI)	+= peci/
 obj-$(CONFIG_PMBUS)		+= pmbus/
 
+obj-$(CONFIG_STUB_TEMP_SENSOR) += stub_temp_sensor.o
+
 ccflags-$(CONFIG_HWMON_DEBUG_CHIP) := -DDEBUG
