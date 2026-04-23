@@ -4,3 +4,5 @@ obj-$(CONFIG_MCTP_TRANSPORT_I3C) += mctp-i3c.o
 obj-$(CONFIG_MCTP_TRANSPORT_USB) += mctp-usb.o
 obj-$(CONFIG_MCTP_TRANSPORT_PCIE_VDM) += mctp-pcie-vdm.o
 obj-$(CONFIG_MCTP_TRANSPORT_ASPEED_MBOX) += mctp-aspeed-mbox.o
+obj-$(CONFIG_MCTP_TRANSPORT_I2C_SIM) += mctp-i2c-sim.o
+

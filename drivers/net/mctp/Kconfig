@@ -70,6 +70,19 @@ config MCTP_TRANSPORT_ASPEED_MBOX
 	help
 	  Provides a driver to access MCTP devices over Aspeed Mailbox transport.
 
+config MCTP_TRANSPORT_I2C_SIM
+	bool "MCTP I2C simulator (virtual endpoint)"
+	depends on MCTP_TRANSPORT_I2C=y
+	help
+	  Provides a virtual I2C adapter that simulates an MCTP I2C endpoint.
+	  Useful for testing mctpd device discovery without physical hardware.
+
+	  Supports MCTP Control Protocol (Get/Set EID, Get UUID, Get Message
+	  Type Support), PLDM Discovery and Monitoring (GetTID, GetPDR,
+	  GetSensorReading), and Echo loopback with multi-fragment reassembly.
+
+	  Say y here to enable the MCTP I2C simulator for QEMU/development use.
+
 endmenu
 
 endif
