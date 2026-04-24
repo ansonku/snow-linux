@@ -13,6 +13,7 @@
  *   - PLDM Discovery (type 0x00): GetTID, GetPLDMVersion, GetPLDMTypes,
  *                                  GetPLDMCommands, GetDeviceIdentifiers
  *   - PLDM Monitoring (type 0x02): GetPDRRepositoryInfo, GetPDR, GetSensorReading
+ *   - PLDM FRU (type 0x04): GetFRURecordTableMetadata, GetFRURecordTable
  *   - Echo (type 0x7e): loopback with multi-fragment reassembly
  */
 
@@ -23,6 +24,7 @@
 #include <linux/workqueue.h>
 #include <linux/slab.h>
 #include <linux/netdevice.h>
+#include <linux/crc32.h>
 
 #define MCTP_I2C_COMMANDCODE	0x0f
 #define MCTP_CTRL_MSG_TYPE	0x00
@@ -42,6 +44,11 @@
 /* PLDM types */
 #define PLDM_TYPE_DISCOVERY		0x00
 #define PLDM_TYPE_MONITORING		0x02
+#define PLDM_TYPE_FRU			0x04
+
+/* PLDM FRU commands (DSP0257) */
+#define PLDM_CMD_GET_FRU_RECORD_TABLE_METADATA	0x01
+#define PLDM_CMD_GET_FRU_RECORD_TABLE		0x02
 
 /* PLDM Discovery commands */
 #define PLDM_CMD_GET_DEVICE_IDENTIFIERS 0x01
@@ -139,7 +146,7 @@ struct mctp_ctrl_hdr {
 struct pldm_msg_hdr {
 	u8 ic_msg_type;		/* 0x01 = PLDM */
 	u8 rq_d_inst;		/* RQ(7)|D(6)|instance_id(4:0) */
-	u8 pldm_type;		/* 0x00=Discovery, 0x02=Monitoring */
+	u8 pldm_type;		/* 0x00=Discovery, 0x02=Monitoring, 0x04=FRU */
 	u8 cmd;			/* PLDM command code */
 };
 
@@ -237,6 +244,29 @@ static const u8 sim_sensor_aux_names_pdr[] = {
 	0x00, 0x20,		/*   */
 	0x00, 0x31,		/* 1 */
 	0x00, 0x00,		/* null terminator */
+};
+
+/*
+ * FRU Record Table (DSP0257): one General record set with 5 fields.
+ * Manufacturer="JMicron", Model="JM1000", PartNumber="P0001",
+ * Serial="S0001", Name="MCTP Simulator".
+ */
+static const u8 sim_fru_table[] = {
+	/* FRU Record Set Header (5 bytes) */
+	0x01, 0x00,	/* record_set_id = 1 */
+	0x01,		/* record_type = 1 (General) */
+	0x05,		/* num_fields = 5 */
+	0x01,		/* encoding_type = 1 (ASCII) */
+	/* Field: Manufacturer (type=0x05, len=7) */
+	0x05, 0x07, 'J', 'M', 'i', 'c', 'r', 'o', 'n',
+	/* Field: Model (type=0x02, len=6) */
+	0x02, 0x06, 'J', 'M', '1', '0', '0', '0',
+	/* Field: Part Number (type=0x03, len=5) */
+	0x03, 0x05, 'P', '0', '0', '0', '1',
+	/* Field: Serial Number (type=0x04, len=5) */
+	0x04, 0x05, 'S', '0', '0', '0', '1',
+	/* Field: Name (type=0x08, len=14) */
+	0x08, 0x0E, 'M', 'C', 'T', 'P', ' ', 'S', 'i', 'm', 'u', 'l', 'a', 't', 'o', 'r',
 };
 
 /* Deferred work: set net device MTU to MCTP_I2C_MINMTU after mctp-i2c probes */
@@ -469,9 +499,10 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 		break;
 
 	case PLDM_CMD_GET_PLDM_TYPES:
-		pr_info("mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2\n");
+		pr_info("mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2,type4\n");
 		memset(resp, 0, 8);
-		resp[0] = BIT(PLDM_TYPE_DISCOVERY) | BIT(PLDM_TYPE_MONITORING);
+		resp[0] = BIT(PLDM_TYPE_DISCOVERY) | BIT(PLDM_TYPE_MONITORING) |
+			  BIT(PLDM_TYPE_FRU);
 		resp_len = 8;
 		break;
 
@@ -493,6 +524,11 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 			/* GetPDRRepositoryInfo=0x50(80) → byte10 bit0 */
 			/* GetPDR=0x51(81) → byte10 bit1 */
 			resp[10] = BIT(0) | BIT(1);
+		} else if (payload[0] == PLDM_TYPE_FRU) {
+			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(FRU)\n");
+			/* GetFRURecordTableMetadata=0x01 → byte0 bit1 */
+			/* GetFRURecordTable=0x02 → byte0 bit2 */
+			resp[0] = BIT(1) | BIT(2);
 		}
 		resp_len = 32;
 		break;
@@ -614,6 +650,64 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 			       PLDM_SUCCESS, resp, resp_len);
 }
 
+/* Handle PLDM FRU (type=0x04) commands */
+static void sim_handle_pldm_fru(struct mctp_i2c_sim *sim,
+				u8 dest_addr, u8 dest_eid, u8 mctp_tag,
+				u8 inst_id, u8 cmd,
+				const u8 *payload, size_t payload_len)
+{
+	/* max resp: GetFRURecordTable = 4+1+sizeof(fru_table)+4 bytes */
+	u8 resp[5 + sizeof(sim_fru_table) + 4];
+	size_t resp_len = 0;
+	u32 fru_crc;
+
+	switch (cmd) {
+	case PLDM_CMD_GET_FRU_RECORD_TABLE_METADATA:
+		pr_info("mctp-i2c-sim: PLDM GetFRURecordTableMetadata → %zu bytes, 1 record\n",
+			sizeof(sim_fru_table));
+		fru_crc = crc32_le(0, sim_fru_table, sizeof(sim_fru_table));
+		memset(resp, 0, 18);
+		resp[0] = 0x01;				/* fruDataMajorVersion = 1 */
+		resp[1] = 0x00;				/* fruDataMinorVersion = 0 */
+		resp[2] = sizeof(sim_fru_table);	/* fruTableMaximumSize (uint32 LE) */
+		resp[6] = sizeof(sim_fru_table);	/* fruTableLength (uint32 LE) */
+		resp[10] = 0x01;			/* totalRecordSetIdentifiers (uint16 LE) */
+		resp[12] = 0x01;			/* totalTableRecords (uint16 LE) */
+		resp[14] = (u8)(fru_crc);		/* checksum (uint32 LE) */
+		resp[15] = (u8)(fru_crc >> 8);
+		resp[16] = (u8)(fru_crc >> 16);
+		resp[17] = (u8)(fru_crc >> 24);
+		resp_len = 18;
+		break;
+
+	case PLDM_CMD_GET_FRU_RECORD_TABLE:
+		pr_info("mctp-i2c-sim: PLDM GetFRURecordTable → %zu bytes\n",
+			sizeof(sim_fru_table));
+		fru_crc = crc32_le(0, sim_fru_table, sizeof(sim_fru_table));
+		memset(resp, 0, 5);
+		/* nextDataTransferHandle (uint32 LE) = 0 */
+		resp[4] = 0x05;				/* transferFlag: Start and End */
+		memcpy(resp + 5, sim_fru_table, sizeof(sim_fru_table));
+		resp[5 + sizeof(sim_fru_table) + 0] = (u8)(fru_crc);
+		resp[5 + sizeof(sim_fru_table) + 1] = (u8)(fru_crc >> 8);
+		resp[5 + sizeof(sim_fru_table) + 2] = (u8)(fru_crc >> 16);
+		resp[5 + sizeof(sim_fru_table) + 3] = (u8)(fru_crc >> 24);
+		resp_len = 5 + sizeof(sim_fru_table) + 4;
+		break;
+
+	default:
+		pr_info("mctp-i2c-sim: PLDM FRU unhandled cmd=0x%02x\n", cmd);
+		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+				       inst_id, PLDM_TYPE_FRU, cmd,
+				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
+		return;
+	}
+
+	sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+			       inst_id, PLDM_TYPE_FRU, cmd,
+			       PLDM_SUCCESS, resp, resp_len);
+}
+
 /* Dispatch incoming PLDM message to the appropriate handler */
 static void sim_process_pldm(struct mctp_i2c_sim *sim,
 			     u8 dest_addr, u8 dest_eid, u8 mctp_tag,
@@ -635,6 +729,11 @@ static void sim_process_pldm(struct mctp_i2c_sim *sim,
 		sim_handle_pldm_monitoring(sim, dest_addr, dest_eid, mctp_tag,
 					   inst_id, pldm_hdr->cmd,
 					   payload, payload_len);
+		break;
+	case PLDM_TYPE_FRU:
+		sim_handle_pldm_fru(sim, dest_addr, dest_eid, mctp_tag,
+				    inst_id, pldm_hdr->cmd,
+				    payload, payload_len);
 		break;
 	default:
 		pr_info("mctp-i2c-sim: PLDM unhandled type=0x%02x cmd=0x%02x → ERROR_UNSUPPORTED\n",
