@@ -147,6 +147,7 @@ struct pldm_msg_hdr {
  * Numeric Sensor PDR for simulated temperature sensor (DSP0248 Table 87).
  * sensor_id=1, base_unit=°C, unit_modifier=-2 (reading × 0.01 = °C),
  * sensor_data_size=sint16 (3), max=200.00°C, min=-10.00°C.
+ * Thresholds: warning [0, 60]°C  critical [-5, 70]°C
  * base_oem_unit_handle / aux_oem_unit_handle are uint8 per libpldm struct.
  */
 static const u8 sim_temp_pdr[] = {
@@ -182,23 +183,23 @@ static const u8 sim_temp_pdr[] = {
 	0x00,			/* plus_tolerance = 0 */
 	0x00,			/* minus_tolerance = 0 */
 	0x00, 0x00,		/* hysteresis = 0 (sint16) */
-	0x00,			/* supported_thresholds = 0 */
+	0x1B,			/* supported_thresholds: upperWarning|upperCritical|lowerWarning|lowerCritical */
 	0x00,			/* threshold_and_hysteresis_volatility = 0 */
 	0x00, 0x00, 0x00, 0x00,	/* state_transition_interval = 0.0 */
 	0x00, 0x00, 0x20, 0x41,	/* update_interval = 10.0 */
 	0x20, 0x4E,		/* max_readable = 20000 (200.00°C) sint16 LE */
 	0x18, 0xFC,		/* min_readable = -1000 (-10.00°C) sint16 LE */
 	0x03,			/* range_field_format = 3 (sint16) */
-	0x00,			/* range_field_support = 0 (no thresholds) */
+	0x78,			/* range_field_support: warningHigh|warningLow|criticalHigh|criticalLow */
 	0x00, 0x00,		/* nominal_value = 0 */
 	0x00, 0x00,		/* normal_max = 0 */
 	0x00, 0x00,		/* normal_min = 0 */
-	0x00, 0x00,		/* warning_high = 0 */
-	0x00, 0x00,		/* warning_low = 0 */
-	0x00, 0x00,		/* critical_high = 0 */
-	0x00, 0x00,		/* critical_low = 0 */
+	0x70, 0x17,		/* warning_high  =  6000 → 60.00°C */
+	0x00, 0x00,		/* warning_low   =     0 →  0.00°C */
+	0x58, 0x1B,		/* critical_high =  7000 → 70.00°C */
+	0x0C, 0xFE,		/* critical_low  =  -500 → -5.00°C */
 	0x00, 0x00,		/* fatal_high = 0 */
-	0x00, 0x00,		/* fatal_low = 0 */
+	0x00, 0x00,		/* fatal_low  = 0 */
 };
 
 /*
