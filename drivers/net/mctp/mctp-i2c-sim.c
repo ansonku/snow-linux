@@ -14,6 +14,7 @@
  *                                  GetPLDMCommands, GetDeviceIdentifiers
  *   - PLDM Monitoring (type 0x02): GetPDRRepositoryInfo, GetPDR, GetSensorReading
  *   - PLDM FRU (type 0x04): GetFRURecordTableMetadata, GetFRURecordTable
+ *   - PLDM FWUP (type 0x05): QueryDeviceIdentifiers, GetFirmwareParameters
  *   - Echo (type 0x7e): loopback with multi-fragment reassembly
  */
 
@@ -45,10 +46,18 @@
 #define PLDM_TYPE_DISCOVERY		0x00
 #define PLDM_TYPE_MONITORING		0x02
 #define PLDM_TYPE_FRU			0x04
+#define PLDM_TYPE_FWUP			0x05
 
 /* PLDM FRU commands (DSP0257) */
 #define PLDM_CMD_GET_FRU_RECORD_TABLE_METADATA	0x01
 #define PLDM_CMD_GET_FRU_RECORD_TABLE		0x02
+
+/* PLDM FWUP commands (DSP0267) */
+#define PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS	0x01
+#define PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS	0x02
+
+/* JMicron PCI Vendor ID */
+#define SIM_PCI_VENDOR_ID	0x197B
 
 /* PLDM Discovery commands */
 #define PLDM_CMD_GET_DEVICE_IDENTIFIERS 0x01
@@ -499,10 +508,10 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 		break;
 
 	case PLDM_CMD_GET_PLDM_TYPES:
-		pr_info("mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2,type4\n");
+		pr_info("mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2,type4,type5\n");
 		memset(resp, 0, 8);
 		resp[0] = BIT(PLDM_TYPE_DISCOVERY) | BIT(PLDM_TYPE_MONITORING) |
-			  BIT(PLDM_TYPE_FRU);
+			  BIT(PLDM_TYPE_FRU) | BIT(PLDM_TYPE_FWUP);
 		resp_len = 8;
 		break;
 
@@ -529,6 +538,12 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 			/* GetFRURecordTableMetadata=0x01 → byte0 bit1 */
 			/* GetFRURecordTable=0x02 → byte0 bit2 */
 			resp[0] = BIT(1) | BIT(2);
+		} else if (payload[0] == PLDM_TYPE_FWUP) {
+			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(FWUP)\n");
+			/* QueryDeviceIdentifiers=0x01 → byte0 bit1 */
+			/* GetFirmwareParameters=0x02 → byte0 bit2 */
+			resp[0] = BIT(PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS) |
+				  BIT(PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS);
 		}
 		resp_len = 32;
 		break;
@@ -708,6 +723,86 @@ static void sim_handle_pldm_fru(struct mctp_i2c_sim *sim,
 			       PLDM_SUCCESS, resp, resp_len);
 }
 
+/* Handle PLDM FWUP (type=0x05) Phase 1 inventory commands (DSP0267) */
+static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
+				 u8 dest_addr, u8 dest_eid, u8 mctp_tag,
+				 u8 inst_id, u8 cmd,
+				 const u8 *payload, size_t payload_len)
+{
+	u8 resp[128];
+	size_t resp_len = 0;
+
+	switch (cmd) {
+	case PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS:
+		pr_info("mctp-i2c-sim: PLDM QueryDeviceIdentifiers → VID=0x%04X\n",
+			SIM_PCI_VENDOR_ID);
+		memset(resp, 0, 11);
+		/* deviceIdentifiersLength (uint32 LE) = 6 (one descriptor record) */
+		resp[0] = 0x06;
+		/* descriptorCount = 1 */
+		resp[4] = 0x01;
+		/* descriptor[0]: PCI Vendor ID (type=0x0000, len=2) */
+		resp[5] = 0x00; resp[6] = 0x00;		/* type = 0x0000 */
+		resp[7] = 0x02; resp[8] = 0x00;		/* length = 2 */
+		resp[9]  = (u8)(SIM_PCI_VENDOR_ID & 0xff);	/* VID low byte */
+		resp[10] = (u8)(SIM_PCI_VENDOR_ID >> 8);	/* VID high byte */
+		resp_len = 11;
+		break;
+
+	case PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS:
+		pr_info("mctp-i2c-sim: PLDM GetFirmwareParameters → 1 component v1.0.0\n");
+		memset(resp, 0, sizeof(resp));
+		/*
+		 * Response layout (DSP0267 Table 26), offsets relative to resp[]:
+		 *   [0-3]   capabilitiesDuringUpdate (uint32 LE) = 0
+		 *   [4-5]   comp_count (uint16 LE) = 1
+		 *   [6]     activeCompImageSetVerStrType = 1 (ASCII)
+		 *   [7]     activeCompImageSetVerStrLen  = 5
+		 *   [8]     pendingCompImageSetVerStrType = 0
+		 *   [9]     pendingCompImageSetVerStrLen  = 0
+		 *   [10-14] activeCompImageSetVerStr = "1.0.0"
+		 * Component entry (offset 15):
+		 *   [15-16] comp_classification (uint16 LE) = 0x000A (Firmware)
+		 *   [17-18] comp_identifier (uint16 LE) = 0x0001
+		 *   [19]    comp_classification_index = 0
+		 *   [20-23] active_comp_comparison_stamp (uint32 LE) = 0
+		 *   [24]    active_comp_ver_str_type = 1 (ASCII)
+		 *   [25]    active_comp_ver_str_len  = 5
+		 *   [26-33] active_comp_release_date (uint8[8]) = 0
+		 *   [34-37] pending_comp_comparison_stamp (uint32 LE) = 0
+		 *   [38]    pending_comp_ver_str_type = 0
+		 *   [39]    pending_comp_ver_str_len  = 0
+		 *   [40-47] pending_comp_release_date (uint8[8]) = 0
+		 *   [48-49] comp_activation_methods (uint16 LE) = 0x0002 (System Reboot)
+		 *   [50-53] capabilities_during_update (uint32 LE) = 0
+		 *   [54-58] active_comp_ver_str = "1.0.0"
+		 */
+		resp[4]  = 0x01;		/* comp_count low (uint16 LE) = 1 */
+		resp[6]  = 0x01;		/* activeCompImageSetVerStrType: ASCII */
+		resp[7]  = 0x05;		/* activeCompImageSetVerStrLen */
+		memcpy(resp + 10, "1.0.0", 5);	/* activeCompImageSetVerStr */
+		resp[15] = 0x0A;		/* comp_classification low: Firmware */
+		resp[17] = 0x01;		/* comp_identifier low */
+		resp[24] = 0x01;		/* active_comp_ver_str_type: ASCII */
+		resp[25] = 0x05;		/* active_comp_ver_str_len */
+		resp[48] = 0x02;		/* comp_activation_methods: System Reboot */
+		memcpy(resp + 54, "1.0.0", 5);	/* active_comp_ver_str */
+		resp_len = 59;
+		break;
+
+	default:
+		pr_info("mctp-i2c-sim: PLDM FWUP unhandled cmd=0x%02x\n", cmd);
+		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+				       inst_id, PLDM_TYPE_FWUP, cmd,
+				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
+		return;
+	}
+
+	sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+			       inst_id, PLDM_TYPE_FWUP, cmd,
+			       PLDM_SUCCESS, resp, resp_len);
+}
+
 /* Dispatch incoming PLDM message to the appropriate handler */
 static void sim_process_pldm(struct mctp_i2c_sim *sim,
 			     u8 dest_addr, u8 dest_eid, u8 mctp_tag,
@@ -734,6 +829,11 @@ static void sim_process_pldm(struct mctp_i2c_sim *sim,
 		sim_handle_pldm_fru(sim, dest_addr, dest_eid, mctp_tag,
 				    inst_id, pldm_hdr->cmd,
 				    payload, payload_len);
+		break;
+	case PLDM_TYPE_FWUP:
+		sim_handle_pldm_fwup(sim, dest_addr, dest_eid, mctp_tag,
+				     inst_id, pldm_hdr->cmd,
+				     payload, payload_len);
 		break;
 	default:
 		pr_info("mctp-i2c-sim: PLDM unhandled type=0x%02x cmd=0x%02x → ERROR_UNSUPPORTED\n",
