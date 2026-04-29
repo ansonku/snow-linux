@@ -14,7 +14,10 @@
  *                                  GetPLDMCommands, GetDeviceIdentifiers
  *   - PLDM Monitoring (type 0x02): GetPDRRepositoryInfo, GetPDR, GetSensorReading
  *   - PLDM FRU (type 0x04): GetFRURecordTableMetadata, GetFRURecordTable
- *   - PLDM FWUP (type 0x05): QueryDeviceIdentifiers, GetFirmwareParameters
+ *   - PLDM FWUP (type 0x05): Phase 1 inventory (QueryDeviceIdentifiers,
+ *                               GetFirmwareParameters) + Phase 2 update state
+ *                               machine (RequestFirmwareData, TransferComplete,
+ *                               VerifyComplete, ApplyComplete)
  *   - Echo (type 0x7e): loopback with multi-fragment reassembly
  */
 
@@ -55,9 +58,25 @@
 /* PLDM FWUP commands (DSP0267) */
 #define PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS	0x01
 #define PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS	0x02
+#define PLDM_CMD_FWUP_REQUEST_UPDATE		0x10
+#define PLDM_CMD_FWUP_PASS_COMPONENT_TABLE	0x13
+#define PLDM_CMD_FWUP_UPDATE_COMPONENT		0x14
+#define PLDM_CMD_FWUP_REQUEST_FIRMWARE_DATA	0x15
+#define PLDM_CMD_FWUP_TRANSFER_COMPLETE		0x16
+#define PLDM_CMD_FWUP_VERIFY_COMPLETE		0x17
+#define PLDM_CMD_FWUP_APPLY_COMPLETE		0x18
+#define PLDM_CMD_FWUP_ACTIVATE_FIRMWARE		0x1a
+
+/* MCTP Tag Owner bit (bit 3 of flags_seq_tag) */
+#define MCTP_HDR_TO	BIT(3)
 
 /* JMicron PCI Vendor ID */
 #define SIM_PCI_VENDOR_ID	0x197B
+
+/* FWUP firmware chunk size per RequestFirmwareData */
+#define SIM_FWUP_CHUNK_SIZE	64
+/* Fixed MCTP tag used for simulator-initiated FWUP requests (TO=1) */
+#define SIM_FWUP_TAG		1
 
 /* PLDM Discovery commands */
 #define PLDM_CMD_GET_DEVICE_IDENTIFIERS 0x01
@@ -107,6 +126,26 @@ static const u8 sim_uuid[16] = {
 	0xee, 0xff, 0x00, 0x11,
 };
 
+/* FWUP state machine */
+enum sim_fwup_state {
+	SIM_FWUP_IDLE,
+	SIM_FWUP_READY_XFER,	/* RequestUpdate accepted */
+	SIM_FWUP_DOWNLOAD,	/* downloading via RequestFirmwareData */
+	SIM_FWUP_VERIFY,	/* TransferComplete sent, waiting ack */
+	SIM_FWUP_VERIFY2,	/* VerifyComplete sent, waiting ack */
+	SIM_FWUP_APPLY,		/* ApplyComplete sent, waiting ack */
+	SIM_FWUP_ACTIVATING,	/* waiting for ActivateFirmware from BMC */
+};
+
+struct sim_fwup_ctx {
+	enum sim_fwup_state	state;
+	u32			total_size;	/* from UpdateComponent */
+	u32			offset;		/* bytes downloaded so far */
+	u8			inst_id;	/* incrementing PLDM instance id */
+	u8			dest_addr;	/* BMC I2C address */
+	u8			dest_eid;	/* BMC EID */
+};
+
 struct mctp_i2c_sim {
 	struct i2c_adapter	adapter;
 	struct i2c_client	*slave;		/* registered by mctp-i2c driver */
@@ -126,6 +165,15 @@ struct mctp_i2c_sim {
 	u8			pldm_dest_addr;	/* I2C addr to send response to */
 	u8			pldm_dest_eid;	/* BMC EID (response destination) */
 	u8			pldm_mctp_tag;	/* MCTP tag from first fragment */
+
+	/* FWUP Phase 2 state machine */
+	struct sim_fwup_ctx	fwup;
+	spinlock_t		fwup_lock;
+	struct delayed_work	fwup_work;
+
+	/* FWUP firmware version tracking */
+	char			fw_active_version[32];	/* current active version */
+	char			fw_pending_version[32];	/* version from UpdateComponent */
 
 	/* deferred work to set net device MTU after mctp-i2c probes */
 	struct delayed_work	mtu_work;
@@ -457,6 +505,87 @@ static void sim_send_fragmented_msg(struct mctp_i2c_sim *sim,
 }
 
 
+/*
+ * Build and inject an MCTP message with TO=1 (simulator is tag owner).
+ * Used for FWUP Phase 2 active requests sent from simulator to BMC.
+ */
+static void sim_send_fragmented_request(struct mctp_i2c_sim *sim,
+					u8 dest_addr, u8 dest_eid,
+					u8 tag,
+					const u8 *payload, size_t payload_len)
+{
+	u8 buf[sizeof(struct mctp_i2c_hdr) + MCTP_I2C_MAX_PAYLOAD +
+	       sizeof(struct mctp_hdr) + 1];
+	struct mctp_i2c_hdr *i2c_hdr = (struct mctp_i2c_hdr *)buf;
+	struct mctp_hdr *mctp_hdr_p;
+	size_t offset = 0;
+	u8 seq = 0;
+	u8 pec;
+
+	while (offset < payload_len) {
+		size_t frag_len = min(payload_len - offset,
+				      (size_t)MCTP_I2C_MAX_PAYLOAD);
+		size_t data_len = sizeof(struct mctp_hdr) + frag_len;
+		bool is_som = (offset == 0);
+		bool is_eom = (offset + frag_len >= payload_len);
+		u8 flags = 0;
+
+		if (is_som)
+			flags |= MCTP_HDR_SOM;
+		if (is_eom)
+			flags |= MCTP_HDR_EOM;
+		flags |= (seq & 0x03) << 4;
+		flags |= MCTP_HDR_TO | (tag & 0x07);	/* TO=1: simulator owns tag */
+
+		i2c_hdr->dest_slave   = dest_addr << 1;
+		i2c_hdr->command      = MCTP_I2C_COMMANDCODE;
+		i2c_hdr->byte_count   = 1 + data_len;
+		i2c_hdr->source_slave = (SIM_EP_ADDR << 1) | 0x01;
+
+		mctp_hdr_p = (struct mctp_hdr *)(buf + sizeof(struct mctp_i2c_hdr));
+		mctp_hdr_p->ver           = MCTP_HDR_VER;
+		mctp_hdr_p->dest          = dest_eid;
+		mctp_hdr_p->src           = sim->ep_eid;
+		mctp_hdr_p->flags_seq_tag = flags;
+
+		memcpy((u8 *)(mctp_hdr_p + 1), payload + offset, frag_len);
+
+		pec = i2c_smbus_pec(0, buf,
+				    sizeof(struct mctp_i2c_hdr) + data_len);
+		buf[sizeof(struct mctp_i2c_hdr) + data_len] = pec;
+
+		sim_inject_response(sim, buf + 1,
+				    sizeof(struct mctp_i2c_hdr) - 1 + data_len + 1);
+
+		offset += frag_len;
+		seq++;
+	}
+}
+
+/* Build and inject a PLDM request (RQ=1, TO=1) for FWUP Phase 2 */
+static void sim_send_pldm_request(struct mctp_i2c_sim *sim,
+				  u8 dest_addr, u8 dest_eid, u8 tag,
+				  u8 inst_id, u8 pldm_type, u8 cmd,
+				  const u8 *data, size_t data_len)
+{
+	u8 payload[256];
+	size_t payload_len;
+
+	payload[0] = MCTP_MSG_TYPE_PLDM;
+	payload[1] = 0x80 | (inst_id & 0x1f);	/* RQ=1, D=0 */
+	payload[2] = pldm_type;
+	payload[3] = cmd;
+	if (data && data_len)
+		memcpy(payload + 4, data, data_len);
+	payload_len = 4 + data_len;
+
+	pr_info("mctp-i2c-sim: FWUP >> type=0x%02x cmd=0x%02x inst=%u\n",
+		pldm_type, cmd, inst_id);
+
+	sim_send_fragmented_request(sim, dest_addr, dest_eid, tag,
+				    payload, payload_len);
+}
+
 /* Build and inject a PLDM response */
 static void sim_send_pldm_response(struct mctp_i2c_sim *sim,
 				   u8 dest_addr, u8 dest_eid, u8 mctp_tag,
@@ -540,10 +669,17 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 			resp[0] = BIT(1) | BIT(2);
 		} else if (payload[0] == PLDM_TYPE_FWUP) {
 			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(FWUP)\n");
-			/* QueryDeviceIdentifiers=0x01 → byte0 bit1 */
-			/* GetFirmwareParameters=0x02 → byte0 bit2 */
+			/* Phase 1: QueryDeviceIdentifiers=0x01, GetFirmwareParameters=0x02 */
 			resp[0] = BIT(PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS) |
 				  BIT(PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS);
+			/* Phase 2 (byte2): RequestUpdate=0x10 */
+			resp[2] = BIT(PLDM_CMD_FWUP_REQUEST_UPDATE & 0x07);
+			/* Phase 2 (byte2): PassComponentTable=0x13, UpdateComponent=0x14 */
+			/* Phase 2 (byte2): RequestFirmwareData=0x15, TransferComplete=0x16 */
+			/* Phase 2 (byte2): VerifyComplete=0x17, ApplyComplete=0x18 */
+			/* Phase 2 (byte3): ActivateFirmware=0x1a */
+			resp[2] |= BIT(3) | BIT(4) | BIT(5) | BIT(6) | BIT(7);
+			resp[3]  = BIT(0) | BIT(2);
 		}
 		resp_len = 32;
 		break;
@@ -749,46 +885,138 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 		resp_len = 11;
 		break;
 
-	case PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS:
-		pr_info("mctp-i2c-sim: PLDM GetFirmwareParameters → 1 component v1.0.0\n");
-		memset(resp, 0, sizeof(resp));
+	case PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS: {
 		/*
-		 * Response layout (DSP0267 Table 26), offsets relative to resp[]:
-		 *   [0-3]   capabilitiesDuringUpdate (uint32 LE) = 0
-		 *   [4-5]   comp_count (uint16 LE) = 1
-		 *   [6]     activeCompImageSetVerStrType = 1 (ASCII)
-		 *   [7]     activeCompImageSetVerStrLen  = 5
-		 *   [8]     pendingCompImageSetVerStrType = 0
-		 *   [9]     pendingCompImageSetVerStrLen  = 0
-		 *   [10-14] activeCompImageSetVerStr = "1.0.0"
-		 * Component entry (offset 15):
-		 *   [15-16] comp_classification (uint16 LE) = 0x000A (Firmware)
-		 *   [17-18] comp_identifier (uint16 LE) = 0x0001
-		 *   [19]    comp_classification_index = 0
-		 *   [20-23] active_comp_comparison_stamp (uint32 LE) = 0
-		 *   [24]    active_comp_ver_str_type = 1 (ASCII)
-		 *   [25]    active_comp_ver_str_len  = 5
-		 *   [26-33] active_comp_release_date (uint8[8]) = 0
-		 *   [34-37] pending_comp_comparison_stamp (uint32 LE) = 0
-		 *   [38]    pending_comp_ver_str_type = 0
-		 *   [39]    pending_comp_ver_str_len  = 0
-		 *   [40-47] pending_comp_release_date (uint8[8]) = 0
-		 *   [48-49] comp_activation_methods (uint16 LE) = 0x0002 (System Reboot)
-		 *   [50-53] capabilities_during_update (uint32 LE) = 0
-		 *   [54-58] active_comp_ver_str = "1.0.0"
+		 * Response layout (DSP0267 Table 26) with dynamic version string.
+		 * ver_len = strlen(fw_active_version)
+		 * comp_entry_off = 10 + ver_len
+		 *
+		 * Fixed header (10 bytes):
+		 *   [0-3]  capabilitiesDuringUpdate (uint32 LE) = 0
+		 *   [4-5]  comp_count (uint16 LE) = 1
+		 *   [6]    activeCompImageSetVerStrType = 1 (ASCII)
+		 *   [7]    activeCompImageSetVerStrLen  = ver_len
+		 *   [8]    pendingCompImageSetVerStrType = 0
+		 *   [9]    pendingCompImageSetVerStrLen  = 0
+		 *   [10..] activeCompImageSetVerStr (ver_len bytes)
+		 * Component entry (comp_entry_off, 39 bytes fixed):
+		 *   [+0-1]  comp_classification = 0x000A (Firmware)
+		 *   [+2-3]  comp_identifier = 0x0001
+		 *   [+9]    active_comp_ver_str_type = 1 (ASCII)
+		 *   [+10]   active_comp_ver_str_len = ver_len
+		 *   [+33-34] comp_activation_methods = 0x0002 (System Reboot)
+		 *   [+39..] active_comp_ver_str (ver_len bytes)
+		 * Total resp_len = 49 + 2 * ver_len
 		 */
-		resp[4]  = 0x01;		/* comp_count low (uint16 LE) = 1 */
-		resp[6]  = 0x01;		/* activeCompImageSetVerStrType: ASCII */
-		resp[7]  = 0x05;		/* activeCompImageSetVerStrLen */
-		memcpy(resp + 10, "1.0.0", 5);	/* activeCompImageSetVerStr */
-		resp[15] = 0x0A;		/* comp_classification low: Firmware */
-		resp[17] = 0x01;		/* comp_identifier low */
-		resp[24] = 0x01;		/* active_comp_ver_str_type: ASCII */
-		resp[25] = 0x05;		/* active_comp_ver_str_len */
-		resp[48] = 0x02;		/* comp_activation_methods: System Reboot */
-		memcpy(resp + 54, "1.0.0", 5);	/* active_comp_ver_str */
-		resp_len = 59;
+		u8 ver_len = (u8)strnlen(sim->fw_active_version,
+					 sizeof(sim->fw_active_version));
+		size_t ce = 10 + ver_len;	/* component entry start offset */
+
+		pr_info("mctp-i2c-sim: PLDM GetFirmwareParameters → 1 component v%s\n",
+			sim->fw_active_version);
+		memset(resp, 0, sizeof(resp));
+		resp[4]       = 0x01;		/* comp_count low (uint16 LE) = 1 */
+		resp[6]       = 0x01;		/* activeCompImageSetVerStrType: ASCII */
+		resp[7]       = ver_len;	/* activeCompImageSetVerStrLen */
+		memcpy(resp + 10, sim->fw_active_version, ver_len);
+		resp[ce + 0]  = 0x0A;		/* comp_classification low: Firmware */
+		resp[ce + 2]  = 0x01;		/* comp_identifier low */
+		resp[ce + 9]  = 0x01;		/* active_comp_ver_str_type: ASCII */
+		resp[ce + 10] = ver_len;	/* active_comp_ver_str_len */
+		resp[ce + 33] = 0x02;		/* comp_activation_methods: System Reboot */
+		memcpy(resp + ce + 39, sim->fw_active_version, ver_len);
+		resp_len = 49 + 2 * ver_len;
 		break;
+	}
+
+	case PLDM_CMD_FWUP_REQUEST_UPDATE: {
+		unsigned long flags;
+
+		pr_info("mctp-i2c-sim: PLDM RequestUpdate → READY_XFER\n");
+		spin_lock_irqsave(&sim->fwup_lock, flags);
+		sim->fwup.state     = SIM_FWUP_READY_XFER;
+		sim->fwup.dest_addr = dest_addr;
+		sim->fwup.dest_eid  = dest_eid;
+		sim->fwup.inst_id   = 0;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		/* FirmwareDeviceMetaDataLength (uint16 LE) = 0 */
+		/* WillSendGetPackageDataCommand (uint8) = 0 */
+		resp[0] = 0x00; resp[1] = 0x00; resp[2] = 0x00;
+		resp_len = 3;
+		break;
+	}
+
+	case PLDM_CMD_FWUP_PASS_COMPONENT_TABLE:
+		pr_info("mctp-i2c-sim: PLDM PassComponentTable → accepted\n");
+		/* ComponentResponse=0 (compatible), ComponentResponseCode=0 */
+		resp[0] = 0x00; resp[1] = 0x00;
+		resp_len = 2;
+		break;
+
+	case PLDM_CMD_FWUP_UPDATE_COMPONENT: {
+		unsigned long flags;
+		u32 img_size;
+
+		if (payload_len < 13) {
+			sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+					       inst_id, PLDM_TYPE_FWUP, cmd,
+					       PLDM_ERROR, NULL, 0);
+			return;
+		}
+		img_size = (u32)payload[9]        | ((u32)payload[10] << 8) |
+			   ((u32)payload[11] << 16) | ((u32)payload[12] << 24);
+
+		/* Extract new version string (type=byte17, len=byte18, str=byte19+) */
+		if (payload_len >= 19) {
+			u8 ver_len = payload[18];
+
+			if (ver_len > 0 && payload_len >= (size_t)(19 + ver_len)) {
+				u8 copy_len = min_t(u8, ver_len,
+						    sizeof(sim->fw_pending_version) - 1);
+				memcpy(sim->fw_pending_version, payload + 19, copy_len);
+				sim->fw_pending_version[copy_len] = '\0';
+			}
+		}
+		pr_info("mctp-i2c-sim: PLDM UpdateComponent size=%u pending=%s → DOWNLOAD\n",
+			img_size, sim->fw_pending_version);
+
+		spin_lock_irqsave(&sim->fwup_lock, flags);
+		sim->fwup.state      = SIM_FWUP_DOWNLOAD;
+		sim->fwup.total_size = img_size;
+		sim->fwup.offset     = 0;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+
+		/* ComponentCompatibilityResponse=0, ResponseCode=0 */
+		/* UpdateOptionFlagsEnabled (uint32 LE) = 0 */
+		/* TimeBeforeRequestFirmwareData (uint16 LE) = 0 ms */
+		memset(resp, 0, 7);
+		resp_len = 7;
+
+		/* Send response first, then start downloading */
+		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
+				       inst_id, PLDM_TYPE_FWUP, cmd,
+				       PLDM_SUCCESS, resp, resp_len);
+		schedule_delayed_work(&sim->fwup_work, 0);
+		return;
+	}
+
+	case PLDM_CMD_FWUP_ACTIVATE_FIRMWARE: {
+		unsigned long flags;
+
+		spin_lock_irqsave(&sim->fwup_lock, flags);
+		if (sim->fw_pending_version[0])
+			strscpy(sim->fw_active_version, sim->fw_pending_version,
+				sizeof(sim->fw_active_version));
+		sim->fw_pending_version[0] = '\0';
+		sim->fwup.state = SIM_FWUP_IDLE;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		pr_info("mctp-i2c-sim: PLDM ActivateFirmware → IDLE (version=%s)\n",
+			sim->fw_active_version);
+		/* EstimatedTimeForActivation (uint16 LE) = 0 seconds */
+		resp[0] = 0x00; resp[1] = 0x00;
+		resp_len = 2;
+		break;
+	}
 
 	default:
 		pr_info("mctp-i2c-sim: PLDM FWUP unhandled cmd=0x%02x\n", cmd);
@@ -803,6 +1031,142 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 			       PLDM_SUCCESS, resp, resp_len);
 }
 
+/* Delayed work: drive FWUP Phase 2 active requests (RequestFirmwareData etc.) */
+static void sim_fwup_active_work(struct work_struct *work)
+{
+	struct mctp_i2c_sim *sim =
+		container_of(work, struct mctp_i2c_sim, fwup_work.work);
+	unsigned long flags;
+	enum sim_fwup_state state;
+	u32 offset, total_size;
+	u8 dest_addr, dest_eid, inst_id;
+	u8 req[8];
+
+	spin_lock_irqsave(&sim->fwup_lock, flags);
+	state      = sim->fwup.state;
+	offset     = sim->fwup.offset;
+	total_size = sim->fwup.total_size;
+	dest_addr  = sim->fwup.dest_addr;
+	dest_eid   = sim->fwup.dest_eid;
+	inst_id    = sim->fwup.inst_id++;
+	spin_unlock_irqrestore(&sim->fwup_lock, flags);
+
+	switch (state) {
+	case SIM_FWUP_DOWNLOAD: {
+		u32 chunk = min_t(u32, SIM_FWUP_CHUNK_SIZE, total_size - offset);
+
+		pr_info("mctp-i2c-sim: FWUP >> RequestFirmwareData offset=%u/%u chunk=%u\n",
+			offset, total_size, chunk);
+		req[0] = (u8)(offset);
+		req[1] = (u8)(offset >> 8);
+		req[2] = (u8)(offset >> 16);
+		req[3] = (u8)(offset >> 24);
+		req[4] = (u8)(chunk);
+		req[5] = (u8)(chunk >> 8);
+		req[6] = (u8)(chunk >> 16);
+		req[7] = (u8)(chunk >> 24);
+		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
+				      inst_id, PLDM_TYPE_FWUP,
+				      PLDM_CMD_FWUP_REQUEST_FIRMWARE_DATA, req, 8);
+		break;
+	}
+	case SIM_FWUP_VERIFY:
+		pr_info("mctp-i2c-sim: FWUP >> TransferComplete\n");
+		req[0] = 0x00; /* TransferResult = success */
+		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
+				      inst_id, PLDM_TYPE_FWUP,
+				      PLDM_CMD_FWUP_TRANSFER_COMPLETE, req, 1);
+		break;
+	case SIM_FWUP_VERIFY2:
+		pr_info("mctp-i2c-sim: FWUP >> VerifyComplete\n");
+		req[0] = 0x00; /* VerifyResult = success */
+		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
+				      inst_id, PLDM_TYPE_FWUP,
+				      PLDM_CMD_FWUP_VERIFY_COMPLETE, req, 1);
+		break;
+	case SIM_FWUP_APPLY:
+		pr_info("mctp-i2c-sim: FWUP >> ApplyComplete\n");
+		req[0] = 0x00; /* ApplyResult = success */
+		req[1] = 0x00; /* ComponentActivationMethodsModification low */
+		req[2] = 0x00; /* ComponentActivationMethodsModification high */
+		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
+				      inst_id, PLDM_TYPE_FWUP,
+				      PLDM_CMD_FWUP_APPLY_COMPLETE, req, 3);
+		break;
+	default:
+		break;
+	}
+}
+
+/* Handle BMC responses to simulator-initiated FWUP requests (RQ=0) */
+static void sim_handle_fwup_response(struct mctp_i2c_sim *sim,
+				     u8 cmd,
+				     const u8 *payload, size_t payload_len)
+{
+	unsigned long flags;
+	enum sim_fwup_state state;
+
+	spin_lock_irqsave(&sim->fwup_lock, flags);
+	state = sim->fwup.state;
+
+	switch (cmd) {
+	case PLDM_CMD_FWUP_REQUEST_FIRMWARE_DATA:
+		if (state != SIM_FWUP_DOWNLOAD)
+			break;
+		if (payload_len < 1 || payload[0] != PLDM_SUCCESS) {
+			pr_warn("mctp-i2c-sim: FWUP RequestFirmwareData error cc=0x%02x\n",
+				payload_len ? payload[0] : 0xff);
+			sim->fwup.state = SIM_FWUP_IDLE;
+			spin_unlock_irqrestore(&sim->fwup_lock, flags);
+			return;
+		}
+		{
+			u32 chunk = (u32)(payload_len - 1);
+
+			sim->fwup.offset += chunk;
+			pr_info("mctp-i2c-sim: FWUP data rx offset=%u/%u\n",
+				sim->fwup.offset, sim->fwup.total_size);
+			if (sim->fwup.offset >= sim->fwup.total_size) {
+				pr_info("mctp-i2c-sim: FWUP download done → VERIFY\n");
+				sim->fwup.state = SIM_FWUP_VERIFY;
+			}
+		}
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		schedule_delayed_work(&sim->fwup_work, 0);
+		return;
+
+	case PLDM_CMD_FWUP_TRANSFER_COMPLETE:
+		if (state != SIM_FWUP_VERIFY)
+			break;
+		pr_info("mctp-i2c-sim: FWUP TransferComplete ack → VERIFY2\n");
+		sim->fwup.state = SIM_FWUP_VERIFY2;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		schedule_delayed_work(&sim->fwup_work, msecs_to_jiffies(100));
+		return;
+
+	case PLDM_CMD_FWUP_VERIFY_COMPLETE:
+		if (state != SIM_FWUP_VERIFY2)
+			break;
+		pr_info("mctp-i2c-sim: FWUP VerifyComplete ack → APPLY\n");
+		sim->fwup.state = SIM_FWUP_APPLY;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		schedule_delayed_work(&sim->fwup_work, msecs_to_jiffies(100));
+		return;
+
+	case PLDM_CMD_FWUP_APPLY_COMPLETE:
+		if (state != SIM_FWUP_APPLY)
+			break;
+		pr_info("mctp-i2c-sim: FWUP ApplyComplete ack → ACTIVATING\n");
+		sim->fwup.state = SIM_FWUP_ACTIVATING;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+		return;
+
+	default:
+		break;
+	}
+	spin_unlock_irqrestore(&sim->fwup_lock, flags);
+}
+
 /* Dispatch incoming PLDM message to the appropriate handler */
 static void sim_process_pldm(struct mctp_i2c_sim *sim,
 			     u8 dest_addr, u8 dest_eid, u8 mctp_tag,
@@ -810,6 +1174,13 @@ static void sim_process_pldm(struct mctp_i2c_sim *sim,
 			     const u8 *payload, size_t payload_len)
 {
 	u8 inst_id  = pldm_hdr->rq_d_inst & 0x1f;
+	bool is_req = !!(pldm_hdr->rq_d_inst & 0x80);
+
+	/* BMC response to one of our active FWUP requests */
+	if (!is_req && pldm_hdr->pldm_type == PLDM_TYPE_FWUP) {
+		sim_handle_fwup_response(sim, pldm_hdr->cmd, payload, payload_len);
+		return;
+	}
 
 	pr_info("mctp-i2c-sim: PLDM << type=0x%02x cmd=0x%02x inst=%u\n",
 		pldm_hdr->pldm_type, pldm_hdr->cmd, inst_id);
@@ -1178,6 +1549,12 @@ static int mctp_i2c_sim_probe(struct platform_device *pdev)
 		return rc;
 	}
 
+	/* FWUP Phase 2 state machine init */
+	spin_lock_init(&sim->fwup_lock);
+	sim->fwup.state = SIM_FWUP_IDLE;
+	strscpy(sim->fw_active_version, "1.0.0", sizeof(sim->fw_active_version));
+	INIT_DELAYED_WORK(&sim->fwup_work, sim_fwup_active_work);
+
 	/* Schedule MTU config after mctp-i2c driver probes the child node */
 	INIT_DELAYED_WORK(&sim->mtu_work, mctp_i2c_sim_set_mtu_work);
 	schedule_delayed_work(&sim->mtu_work, msecs_to_jiffies(500));
@@ -1191,6 +1568,7 @@ static void mctp_i2c_sim_remove(struct platform_device *pdev)
 {
 	struct mctp_i2c_sim *sim = platform_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&sim->fwup_work);
 	cancel_delayed_work_sync(&sim->mtu_work);
 	i2c_del_adapter(&sim->adapter);
 }
