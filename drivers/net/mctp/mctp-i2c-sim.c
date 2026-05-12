@@ -66,6 +66,8 @@
 #define PLDM_CMD_FWUP_VERIFY_COMPLETE		0x17
 #define PLDM_CMD_FWUP_APPLY_COMPLETE		0x18
 #define PLDM_CMD_FWUP_ACTIVATE_FIRMWARE		0x1a
+#define PLDM_CMD_FWUP_GET_STATUS		0x1b
+#define PLDM_PROGRESS_NOT_APPLICABLE		0x65
 
 /* MCTP Tag Owner bit (bit 3 of flags_seq_tag) */
 #define MCTP_HDR_TO	BIT(3)
@@ -356,11 +358,11 @@ static void sim_inject_response(struct mctp_i2c_sim *sim,
 	size_t i;
 
 	if (!sim->slave) {
-		pr_info("mctp-i2c-sim: inject_response: slave is NULL\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: inject_response: slave is NULL\n");
 		return;
 	}
 
-	pr_info("mctp-i2c-sim: injecting response len=%zu to slave 0x%02x\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: injecting response len=%zu to slave 0x%02x\n",
 		len, sim->slave->addr);
 	/* Signal start of write transaction from endpoint to BMC */
 	i2c_slave_event(sim->slave, I2C_SLAVE_WRITE_REQUESTED, &val);
@@ -418,7 +420,7 @@ static void sim_send_ctrl_response(struct mctp_i2c_sim *sim,
 	mctp_hdr_p->src           = sim->ep_eid;
 	/* Tag Owner=0 in response; preserve tag value from request */
 	mctp_hdr_p->flags_seq_tag = MCTP_HDR_SOM | MCTP_HDR_EOM | (mctp_tag & 0x07);
-	pr_info("mctp-i2c-sim: >> cmd=0x%02x dst=%d src=%d tag=0x%02x\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: >> cmd=0x%02x dst=%d src=%d tag=0x%02x\n",
 		cmd, dest_eid, sim->ep_eid, mctp_hdr_p->flags_seq_tag & 0x07);
 
 	ctrl_hdr = (struct mctp_ctrl_hdr *)(mctp_hdr_p + 1);
@@ -456,8 +458,8 @@ static void sim_send_fragmented_msg(struct mctp_i2c_sim *sim,
 	u8 seq = 0;
 	u8 pec;
 
-	pr_info("mctp-i2c-sim: TX >> sending %zu bytes\n", payload_len);
-	pr_info("mctp-i2c-sim: TX raw: %*phN\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: TX >> sending %zu bytes\n", payload_len);
+	printk(KERN_DEBUG "mctp-i2c-sim: TX raw: %*phN\n",
 		(int)payload_len, payload);
 
 	while (offset < payload_len) {
@@ -493,7 +495,7 @@ static void sim_send_fragmented_msg(struct mctp_i2c_sim *sim,
 		buf[sizeof(struct mctp_i2c_hdr) + data_len] = pec;
 
 		if (payload_len > MCTP_I2C_MAX_PAYLOAD)
-			pr_info("mctp-i2c-sim: TX >> frag offset=%zu/%zu som=%d eom=%d seq=%d\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: TX >> frag offset=%zu/%zu som=%d eom=%d seq=%d\n",
 				offset + frag_len, payload_len, is_som, is_eom, seq);
 
 		sim_inject_response(sim, buf + 1,
@@ -579,7 +581,7 @@ static void sim_send_pldm_request(struct mctp_i2c_sim *sim,
 		memcpy(payload + 4, data, data_len);
 	payload_len = 4 + data_len;
 
-	pr_info("mctp-i2c-sim: FWUP >> type=0x%02x cmd=0x%02x inst=%u\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: FWUP >> type=0x%02x cmd=0x%02x inst=%u\n",
 		pldm_type, cmd, inst_id);
 
 	sim_send_fragmented_request(sim, dest_addr, dest_eid, tag,
@@ -604,7 +606,7 @@ static void sim_send_pldm_response(struct mctp_i2c_sim *sim,
 		memcpy(payload + 5, data, data_len);
 	payload_len = 5 + data_len;
 
-	pr_info("mctp-i2c-sim: PLDM >> type=0x%02x cmd=0x%02x inst=%u cc=0x%02x len=%zu\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: PLDM >> type=0x%02x cmd=0x%02x inst=%u cc=0x%02x len=%zu\n",
 		pldm_type, cmd, inst_id, cc, payload_len);
 
 	sim_send_fragmented_msg(sim, dest_addr, dest_eid, mctp_tag,
@@ -622,13 +624,13 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 
 	switch (cmd) {
 	case PLDM_CMD_GET_TID:
-		pr_info("mctp-i2c-sim: PLDM GetTID → TID=1\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetTID → TID=1\n");
 		resp[0] = 0x01; /* TID = 1 */
 		resp_len = 1;
 		break;
 
 	case PLDM_CMD_GET_PLDM_VERSION:
-		pr_info("mctp-i2c-sim: PLDM GetPLDMVersion\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMVersion\n");
 		/* resp: next_transfer_handle(4), transfer_flag(1), version_data(4) */
 		memset(resp, 0, 9);
 		resp[4] = 0x05; /* transfer_flag: start and end */
@@ -637,7 +639,7 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 		break;
 
 	case PLDM_CMD_GET_PLDM_TYPES:
-		pr_info("mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2,type4,type5\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMTypes → type0,type2,type4,type5\n");
 		memset(resp, 0, 8);
 		resp[0] = BIT(PLDM_TYPE_DISCOVERY) | BIT(PLDM_TYPE_MONITORING) |
 			  BIT(PLDM_TYPE_FRU) | BIT(PLDM_TYPE_FWUP);
@@ -649,26 +651,26 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 			break;
 		memset(resp, 0, 32);
 		if (payload[0] == PLDM_TYPE_DISCOVERY) {
-			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(Discovery)\n");
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMCommands(Discovery)\n");
 			resp[0] = BIT(PLDM_CMD_GET_DEVICE_IDENTIFIERS) |
 				  BIT(PLDM_CMD_GET_TID) |
 				  BIT(PLDM_CMD_GET_PLDM_VERSION) |
 				  BIT(PLDM_CMD_GET_PLDM_TYPES) |
 				  BIT(PLDM_CMD_GET_PLDM_COMMANDS);
 		} else if (payload[0] == PLDM_TYPE_MONITORING) {
-			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(Monitoring)\n");
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMCommands(Monitoring)\n");
 			/* GetSensorReading=0x11(17) → byte2 bit1 */
 			resp[2] = BIT(1);
 			/* GetPDRRepositoryInfo=0x50(80) → byte10 bit0 */
 			/* GetPDR=0x51(81) → byte10 bit1 */
 			resp[10] = BIT(0) | BIT(1);
 		} else if (payload[0] == PLDM_TYPE_FRU) {
-			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(FRU)\n");
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMCommands(FRU)\n");
 			/* GetFRURecordTableMetadata=0x01 → byte0 bit1 */
 			/* GetFRURecordTable=0x02 → byte0 bit2 */
 			resp[0] = BIT(1) | BIT(2);
 		} else if (payload[0] == PLDM_TYPE_FWUP) {
-			pr_info("mctp-i2c-sim: PLDM GetPLDMCommands(FWUP)\n");
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPLDMCommands(FWUP)\n");
 			/* Phase 1: QueryDeviceIdentifiers=0x01, GetFirmwareParameters=0x02 */
 			resp[0] = BIT(PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS) |
 				  BIT(PLDM_CMD_FWUP_GET_FIRMWARE_PARAMETERS);
@@ -677,22 +679,22 @@ static void sim_handle_pldm_discovery(struct mctp_i2c_sim *sim,
 			/* Phase 2 (byte2): PassComponentTable=0x13, UpdateComponent=0x14 */
 			/* Phase 2 (byte2): RequestFirmwareData=0x15, TransferComplete=0x16 */
 			/* Phase 2 (byte2): VerifyComplete=0x17, ApplyComplete=0x18 */
-			/* Phase 2 (byte3): ActivateFirmware=0x1a */
+			/* Phase 2 (byte3): ActivateFirmware=0x1a, GetStatus=0x1b */
 			resp[2] |= BIT(3) | BIT(4) | BIT(5) | BIT(6) | BIT(7);
-			resp[3]  = BIT(0) | BIT(2);
+			resp[3]  = BIT(0) | BIT(2) | BIT(3);
 		}
 		resp_len = 32;
 		break;
 
 	case PLDM_CMD_GET_DEVICE_IDENTIFIERS:
-		pr_info("mctp-i2c-sim: PLDM GetDeviceIdentifiers → none\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetDeviceIdentifiers → none\n");
 		/* resp: descriptor_count(1)=0, total_size(4)=0 */
 		memset(resp, 0, 5);
 		resp_len = 5;
 		break;
 
 	default:
-		pr_info("mctp-i2c-sim: PLDM Discovery unhandled cmd=0x%02x\n", cmd);
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM Discovery unhandled cmd=0x%02x\n", cmd);
 		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 				       inst_id, PLDM_TYPE_DISCOVERY, cmd,
 				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
@@ -716,7 +718,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 
 	switch (cmd) {
 	case PLDM_CMD_GET_PDR_REPO_INFO:
-		pr_info("mctp-i2c-sim: PLDM GetPDRRepositoryInfo → 2 records\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPDRRepositoryInfo → 2 records\n");
 		memset(resp, 0, 40);
 		resp[0] = 0x00;         /* repository_state = available */
 		/* record_count (uint32 LE) = 2 */
@@ -736,7 +738,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 					((u32)payload[2] << 16) | ((u32)payload[3] << 24);
 
 		if (record_handle > 2) {
-			pr_info("mctp-i2c-sim: PLDM GetPDR handle=%u → INVALID_RECORD_HANDLE\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPDR handle=%u → INVALID_RECORD_HANDLE\n",
 				record_handle);
 			sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 					       inst_id, PLDM_TYPE_MONITORING, cmd,
@@ -746,7 +748,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 
 		if (record_handle <= 1) {
 			/* handle=0 (first) or handle=1: Numeric Sensor PDR */
-			pr_info("mctp-i2c-sim: PLDM GetPDR handle=%u → Numeric Sensor PDR (%zu bytes)\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPDR handle=%u → Numeric Sensor PDR (%zu bytes)\n",
 				record_handle, sizeof(sim_temp_pdr));
 			memset(resp, 0, 11);
 			resp[0] = 0x02; /* next_record_handle = 2 (Sensor Aux Names PDR) */
@@ -757,7 +759,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 			resp_len = 11 + sizeof(sim_temp_pdr);
 		} else {
 			/* handle=2: Sensor Auxiliary Names PDR */
-			pr_info("mctp-i2c-sim: PLDM GetPDR handle=%u → Sensor Aux Names PDR (%zu bytes)\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetPDR handle=%u → Sensor Aux Names PDR (%zu bytes)\n",
 				record_handle, sizeof(sim_sensor_aux_names_pdr));
 			memset(resp, 0, 11);
 			/* next_record_handle = 0 (no more records) */
@@ -773,7 +775,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 	case PLDM_CMD_GET_SENSOR_READING: {
 		s16 reading = SIM_TEMP_READING;
 
-		pr_info("mctp-i2c-sim: PLDM GetSensorReading → %d (%d.%02d°C)\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetSensorReading → %d (%d.%02d°C)\n",
 			reading, reading / 100, reading % 100);
 
 		resp[0] = 0x03;         /* sensor_data_size = sint16 */
@@ -789,7 +791,7 @@ static void sim_handle_pldm_monitoring(struct mctp_i2c_sim *sim,
 	}
 
 	default:
-		pr_info("mctp-i2c-sim: PLDM Monitoring unhandled cmd=0x%02x\n", cmd);
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM Monitoring unhandled cmd=0x%02x\n", cmd);
 		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 				       inst_id, PLDM_TYPE_MONITORING, cmd,
 				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
@@ -814,7 +816,7 @@ static void sim_handle_pldm_fru(struct mctp_i2c_sim *sim,
 
 	switch (cmd) {
 	case PLDM_CMD_GET_FRU_RECORD_TABLE_METADATA:
-		pr_info("mctp-i2c-sim: PLDM GetFRURecordTableMetadata → %zu bytes, 1 record\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetFRURecordTableMetadata → %zu bytes, 1 record\n",
 			sizeof(sim_fru_table));
 		fru_crc = crc32_le(0, sim_fru_table, sizeof(sim_fru_table));
 		memset(resp, 0, 18);
@@ -832,7 +834,7 @@ static void sim_handle_pldm_fru(struct mctp_i2c_sim *sim,
 		break;
 
 	case PLDM_CMD_GET_FRU_RECORD_TABLE:
-		pr_info("mctp-i2c-sim: PLDM GetFRURecordTable → %zu bytes\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetFRURecordTable → %zu bytes\n",
 			sizeof(sim_fru_table));
 		fru_crc = crc32_le(0, sim_fru_table, sizeof(sim_fru_table));
 		memset(resp, 0, 5);
@@ -847,7 +849,7 @@ static void sim_handle_pldm_fru(struct mctp_i2c_sim *sim,
 		break;
 
 	default:
-		pr_info("mctp-i2c-sim: PLDM FRU unhandled cmd=0x%02x\n", cmd);
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM FRU unhandled cmd=0x%02x\n", cmd);
 		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 				       inst_id, PLDM_TYPE_FRU, cmd,
 				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
@@ -870,7 +872,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 
 	switch (cmd) {
 	case PLDM_CMD_FWUP_QUERY_DEVICE_IDENTIFIERS:
-		pr_info("mctp-i2c-sim: PLDM QueryDeviceIdentifiers → VID=0x%04X\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM QueryDeviceIdentifiers → VID=0x%04X\n",
 			SIM_PCI_VENDOR_ID);
 		memset(resp, 0, 11);
 		/* deviceIdentifiersLength (uint32 LE) = 6 (one descriptor record) */
@@ -912,7 +914,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 					 sizeof(sim->fw_active_version));
 		size_t ce = 10 + ver_len;	/* component entry start offset */
 
-		pr_info("mctp-i2c-sim: PLDM GetFirmwareParameters → 1 component v%s\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetFirmwareParameters → 1 component v%s\n",
 			sim->fw_active_version);
 		memset(resp, 0, sizeof(resp));
 		resp[4]       = 0x01;		/* comp_count low (uint16 LE) = 1 */
@@ -932,7 +934,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 	case PLDM_CMD_FWUP_REQUEST_UPDATE: {
 		unsigned long flags;
 
-		pr_info("mctp-i2c-sim: PLDM RequestUpdate → READY_XFER\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM RequestUpdate → READY_XFER\n");
 		spin_lock_irqsave(&sim->fwup_lock, flags);
 		sim->fwup.state     = SIM_FWUP_READY_XFER;
 		sim->fwup.dest_addr = dest_addr;
@@ -947,7 +949,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 	}
 
 	case PLDM_CMD_FWUP_PASS_COMPONENT_TABLE:
-		pr_info("mctp-i2c-sim: PLDM PassComponentTable → accepted\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM PassComponentTable → accepted\n");
 		/* ComponentResponse=0 (compatible), ComponentResponseCode=0 */
 		resp[0] = 0x00; resp[1] = 0x00;
 		resp_len = 2;
@@ -977,7 +979,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 				sim->fw_pending_version[copy_len] = '\0';
 			}
 		}
-		pr_info("mctp-i2c-sim: PLDM UpdateComponent size=%u pending=%s → DOWNLOAD\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM UpdateComponent size=%u pending=%s → DOWNLOAD\n",
 			img_size, sim->fw_pending_version);
 
 		spin_lock_irqsave(&sim->fwup_lock, flags);
@@ -1010,7 +1012,7 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 		sim->fw_pending_version[0] = '\0';
 		sim->fwup.state = SIM_FWUP_IDLE;
 		spin_unlock_irqrestore(&sim->fwup_lock, flags);
-		pr_info("mctp-i2c-sim: PLDM ActivateFirmware → IDLE (version=%s)\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM ActivateFirmware → IDLE (version=%s)\n",
 			sim->fw_active_version);
 		/* EstimatedTimeForActivation (uint16 LE) = 0 seconds */
 		resp[0] = 0x00; resp[1] = 0x00;
@@ -1018,8 +1020,50 @@ static void sim_handle_pldm_fwup(struct mctp_i2c_sim *sim,
 		break;
 	}
 
+	case PLDM_CMD_FWUP_GET_STATUS: {
+		unsigned long flags;
+		enum sim_fwup_state state;
+		u32 offset, total;
+		u8 pldm_state, aux_state, progress;
+
+		spin_lock_irqsave(&sim->fwup_lock, flags);
+		state  = sim->fwup.state;
+		offset = sim->fwup.offset;
+		total  = sim->fwup.total_size;
+		spin_unlock_irqrestore(&sim->fwup_lock, flags);
+
+		switch (state) {
+		case SIM_FWUP_READY_XFER: pldm_state = 0x02; break;
+		case SIM_FWUP_DOWNLOAD:   pldm_state = 0x03; break;
+		case SIM_FWUP_VERIFY:
+		case SIM_FWUP_VERIFY2:    pldm_state = 0x04; break;
+		case SIM_FWUP_APPLY:      pldm_state = 0x05; break;
+		case SIM_FWUP_ACTIVATING: pldm_state = 0x06; break;
+		default:                  pldm_state = 0x00; break;
+		}
+
+		if (state == SIM_FWUP_DOWNLOAD && total > 0)
+			progress = (u8)min_t(u64, (u64)offset * 100 / total, 100);
+		else if (state == SIM_FWUP_IDLE)
+			progress = PLDM_PROGRESS_NOT_APPLICABLE;
+		else
+			progress = 0x00;
+
+		aux_state = (state == SIM_FWUP_IDLE) ? 0x01 : 0x00;
+
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM GetStatus -> pldm_state=%u progress=%u\n",
+		       pldm_state, progress);
+
+		memset(resp, 0, 10);
+		resp[0] = pldm_state;
+		resp[2] = aux_state;
+		resp[4] = progress;
+		resp_len = 10;
+		break;
+	}
+
 	default:
-		pr_info("mctp-i2c-sim: PLDM FWUP unhandled cmd=0x%02x\n", cmd);
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM FWUP unhandled cmd=0x%02x\n", cmd);
 		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 				       inst_id, PLDM_TYPE_FWUP, cmd,
 				       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, NULL, 0);
@@ -1055,7 +1099,7 @@ static void sim_fwup_active_work(struct work_struct *work)
 	case SIM_FWUP_DOWNLOAD: {
 		u32 chunk = min_t(u32, SIM_FWUP_CHUNK_SIZE, total_size - offset);
 
-		pr_info("mctp-i2c-sim: FWUP >> RequestFirmwareData offset=%u/%u chunk=%u\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP >> RequestFirmwareData offset=%u/%u chunk=%u\n",
 			offset, total_size, chunk);
 		req[0] = (u8)(offset);
 		req[1] = (u8)(offset >> 8);
@@ -1071,21 +1115,21 @@ static void sim_fwup_active_work(struct work_struct *work)
 		break;
 	}
 	case SIM_FWUP_VERIFY:
-		pr_info("mctp-i2c-sim: FWUP >> TransferComplete\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP >> TransferComplete\n");
 		req[0] = 0x00; /* TransferResult = success */
 		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
 				      inst_id, PLDM_TYPE_FWUP,
 				      PLDM_CMD_FWUP_TRANSFER_COMPLETE, req, 1);
 		break;
 	case SIM_FWUP_VERIFY2:
-		pr_info("mctp-i2c-sim: FWUP >> VerifyComplete\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP >> VerifyComplete\n");
 		req[0] = 0x00; /* VerifyResult = success */
 		sim_send_pldm_request(sim, dest_addr, dest_eid, SIM_FWUP_TAG,
 				      inst_id, PLDM_TYPE_FWUP,
 				      PLDM_CMD_FWUP_VERIFY_COMPLETE, req, 1);
 		break;
 	case SIM_FWUP_APPLY:
-		pr_info("mctp-i2c-sim: FWUP >> ApplyComplete\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP >> ApplyComplete\n");
 		req[0] = 0x00; /* ApplyResult = success */
 		req[1] = 0x00; /* ComponentActivationMethodsModification low */
 		req[2] = 0x00; /* ComponentActivationMethodsModification high */
@@ -1124,10 +1168,10 @@ static void sim_handle_fwup_response(struct mctp_i2c_sim *sim,
 			u32 chunk = (u32)(payload_len - 1);
 
 			sim->fwup.offset += chunk;
-			pr_info("mctp-i2c-sim: FWUP data rx offset=%u/%u\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: FWUP data rx offset=%u/%u\n",
 				sim->fwup.offset, sim->fwup.total_size);
 			if (sim->fwup.offset >= sim->fwup.total_size) {
-				pr_info("mctp-i2c-sim: FWUP download done → VERIFY\n");
+				printk(KERN_DEBUG "mctp-i2c-sim: FWUP download done → VERIFY\n");
 				sim->fwup.state = SIM_FWUP_VERIFY;
 			}
 		}
@@ -1138,7 +1182,7 @@ static void sim_handle_fwup_response(struct mctp_i2c_sim *sim,
 	case PLDM_CMD_FWUP_TRANSFER_COMPLETE:
 		if (state != SIM_FWUP_VERIFY)
 			break;
-		pr_info("mctp-i2c-sim: FWUP TransferComplete ack → VERIFY2\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP TransferComplete ack → VERIFY2\n");
 		sim->fwup.state = SIM_FWUP_VERIFY2;
 		spin_unlock_irqrestore(&sim->fwup_lock, flags);
 		schedule_delayed_work(&sim->fwup_work, msecs_to_jiffies(100));
@@ -1147,7 +1191,7 @@ static void sim_handle_fwup_response(struct mctp_i2c_sim *sim,
 	case PLDM_CMD_FWUP_VERIFY_COMPLETE:
 		if (state != SIM_FWUP_VERIFY2)
 			break;
-		pr_info("mctp-i2c-sim: FWUP VerifyComplete ack → APPLY\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP VerifyComplete ack → APPLY\n");
 		sim->fwup.state = SIM_FWUP_APPLY;
 		spin_unlock_irqrestore(&sim->fwup_lock, flags);
 		schedule_delayed_work(&sim->fwup_work, msecs_to_jiffies(100));
@@ -1156,7 +1200,7 @@ static void sim_handle_fwup_response(struct mctp_i2c_sim *sim,
 	case PLDM_CMD_FWUP_APPLY_COMPLETE:
 		if (state != SIM_FWUP_APPLY)
 			break;
-		pr_info("mctp-i2c-sim: FWUP ApplyComplete ack → ACTIVATING\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: FWUP ApplyComplete ack → ACTIVATING\n");
 		sim->fwup.state = SIM_FWUP_ACTIVATING;
 		spin_unlock_irqrestore(&sim->fwup_lock, flags);
 		return;
@@ -1182,7 +1226,7 @@ static void sim_process_pldm(struct mctp_i2c_sim *sim,
 		return;
 	}
 
-	pr_info("mctp-i2c-sim: PLDM << type=0x%02x cmd=0x%02x inst=%u\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: PLDM << type=0x%02x cmd=0x%02x inst=%u\n",
 		pldm_hdr->pldm_type, pldm_hdr->cmd, inst_id);
 
 	switch (pldm_hdr->pldm_type) {
@@ -1207,7 +1251,7 @@ static void sim_process_pldm(struct mctp_i2c_sim *sim,
 				     payload, payload_len);
 		break;
 	default:
-		pr_info("mctp-i2c-sim: PLDM unhandled type=0x%02x cmd=0x%02x → ERROR_UNSUPPORTED\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM unhandled type=0x%02x cmd=0x%02x → ERROR_UNSUPPORTED\n",
 			pldm_hdr->pldm_type, pldm_hdr->cmd);
 		sim_send_pldm_response(sim, dest_addr, dest_eid, mctp_tag,
 				       inst_id, pldm_hdr->pldm_type, pldm_hdr->cmd,
@@ -1293,7 +1337,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 				      - sizeof(struct mctp_hdr) - 1;
 		bool is_eom = !!(mctp_hdr_p->flags_seq_tag & MCTP_HDR_EOM);
 
-		pr_info("mctp-i2c-sim: PLDM << raw: %*phN\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: PLDM << raw: %*phN\n",
 			(int)(len - sizeof(struct mctp_i2c_hdr) - 1), (u8 *)mctp_hdr_p);
 
 		sim->pldm_len       = 0;
@@ -1331,10 +1375,10 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		bool is_eom = !!(flags & MCTP_HDR_EOM);
 		u8 mctp_tag = flags & 0x07;
 
-		pr_info("mctp-i2c-sim: ECHO << frag len=%zu som=%d eom=%d dst=%d src=%d tag=0x%02x\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: ECHO << frag len=%zu som=%d eom=%d dst=%d src=%d tag=0x%02x\n",
 			frag_len, is_som, is_eom,
 			mctp_hdr_p->dest, mctp_hdr_p->src, mctp_tag);
-		pr_info("mctp-i2c-sim: ECHO RX raw: %*phN\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: ECHO RX raw: %*phN\n",
 			(int)frag_len, frag_start);
 
 		if (is_som) {
@@ -1356,7 +1400,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 
 		if (is_eom) {
 			/* full message received, send echo response */
-			pr_info("mctp-i2c-sim: ECHO reassembled total=%zu\n",
+			printk(KERN_DEBUG "mctp-i2c-sim: ECHO reassembled total=%zu\n",
 				sim->echo_len);
 			sim_send_fragmented_msg(sim,
 						sim->echo_dest_addr,
@@ -1381,7 +1425,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		return;
 
 
-	pr_info("mctp-i2c-sim: << cmd=0x%02x dst=%d src=%d tag=0x%02x\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: << cmd=0x%02x dst=%d src=%d tag=0x%02x\n",
 		ctrl_hdr->cmd, mctp_hdr_p->dest, mctp_hdr_p->src,
 		mctp_hdr_p->flags_seq_tag & 0x07);
 
@@ -1395,7 +1439,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		resp[0] = sim->ep_eid;
 		resp[1] = 0x00; /* endpoint type: simple */
 		resp[2] = 0x00; /* medium specific info */
-		pr_info("mctp-i2c-sim: GET_EID → reply EID=%d (%s)\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: GET_EID → reply EID=%d (%s)\n",
 			sim->ep_eid,
 			sim->ep_eid == 0 ? "unassigned" : "assigned");
 		sim_send_ctrl_response(sim, dest_addr,
@@ -1413,7 +1457,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		resp[0] = 0x00; /* status: accepted */
 		resp[1] = sim->ep_eid;
 		resp[2] = 0x00; /* pool size */
-		pr_info("mctp-i2c-sim: SET_EID → assigned EID=%d\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: SET_EID → assigned EID=%d\n",
 			sim->ep_eid);
 		sim_send_ctrl_response(sim, dest_addr,
 				       mctp_hdr_p->dest, mctp_hdr_p->src,
@@ -1423,7 +1467,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 
 	case MCTP_CTRL_CMD_GET_UUID:
 		memcpy(resp, sim_uuid, 16);
-		pr_info("mctp-i2c-sim: GET_UUID → reply fixed UUID\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: GET_UUID → reply fixed UUID\n");
 		sim_send_ctrl_response(sim, dest_addr,
 				       mctp_hdr_p->dest, mctp_hdr_p->src,
 				       mctp_tag, ctrl_inst,
@@ -1435,7 +1479,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		resp[1] = MCTP_CTRL_MSG_TYPE;   /* 0x00: MCTP Control */
 		resp[2] = MCTP_MSG_TYPE_PLDM;   /* 0x01: PLDM */
 		resp[3] = MCTP_MSG_TYPE_ECHO;   /* 0x7e: echo (vendor defined) */
-		pr_info("mctp-i2c-sim: GET_MSG_TYPE → 3 types (Control, PLDM, Echo)\n");
+		printk(KERN_DEBUG "mctp-i2c-sim: GET_MSG_TYPE → 3 types (Control, PLDM, Echo)\n");
 		sim_send_ctrl_response(sim, dest_addr,
 				       mctp_hdr_p->dest, mctp_hdr_p->src,
 				       mctp_tag, ctrl_inst,
@@ -1443,7 +1487,7 @@ static void sim_process_request(struct mctp_i2c_sim *sim,
 		break;
 
 	default:
-		pr_info("mctp-i2c-sim: unhandled ctrl cmd=0x%02x\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: unhandled ctrl cmd=0x%02x\n",
 			ctrl_hdr->cmd);
 		break;
 	}
@@ -1462,7 +1506,7 @@ static int sim_master_xfer(struct i2c_adapter *adap,
 	if (num != 1 || !msg->buf)
 		return -EOPNOTSUPP;
 
-	pr_info("mctp-i2c-sim: master_xfer addr=0x%02x len=%d slave=%p\n",
+	printk(KERN_DEBUG "mctp-i2c-sim: master_xfer addr=0x%02x len=%d slave=%p\n",
 		msg->addr, msg->len, sim->slave);
 
 	if (!sim->slave) {
@@ -1471,7 +1515,7 @@ static int sim_master_xfer(struct i2c_adapter *adap,
 	}
 
 	if (msg->addr != SIM_EP_ADDR) {
-		pr_info("mctp-i2c-sim: unknown addr 0x%02x (expected 0x%02x)\n",
+		printk(KERN_DEBUG "mctp-i2c-sim: unknown addr 0x%02x (expected 0x%02x)\n",
 			msg->addr, SIM_EP_ADDR);
 		return -ENXIO;
 	}
@@ -1502,7 +1546,7 @@ static int sim_reg_slave(struct i2c_client *client)
 	struct mctp_i2c_sim *sim = client->adapter->algo_data;
 
 	sim->slave = client;
-	pr_info("mctp-i2c-sim: slave registered addr=0x%02x\n", client->addr);
+	printk(KERN_DEBUG "mctp-i2c-sim: slave registered addr=0x%02x\n", client->addr);
 	return 0;
 }
 
